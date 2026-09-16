@@ -26,13 +26,17 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(self.attrs["RETURN_TYPES"][:3], ("FLOAT", "FLOAT", "FLOAT"))
 
     def test_appended_diagnostics(self):
-        self.assertEqual(self.attrs["RETURN_NAMES"][3:], (
+        self.assertEqual(self.attrs["RETURN_NAMES"][3:7], (
             "camera_tilt_deg", "pitch_uncertainty_deg", "horizon_preview", "debug_json"
         ))
-        self.assertEqual(len(self.attrs["RETURN_TYPES"]), 7)
+        self.assertEqual(self.attrs["RETURN_NAMES"][7:], (
+            "focal_length_mm", "camera_rotation_x_degrees", "camera_rotation_y_degrees",
+        ))
+        self.assertEqual(self.attrs["RETURN_TYPES"][7:], ("FLOAT", "FLOAT", "FLOAT"))
+        self.assertEqual(len(self.attrs["RETURN_TYPES"]), 10)
 
     def test_every_output_has_explicit_per_frame_list_semantics(self):
-        self.assertEqual(self.attrs.get("OUTPUT_IS_LIST"), (True, True, True, True, True, True, True))
+        self.assertEqual(self.attrs.get("OUTPUT_IS_LIST"), (True,) * 10)
 
     def test_official_backend_is_commit_pinned(self):
         requirements = (ROOT / "requirements.txt").read_text()

@@ -22,9 +22,14 @@ diag = sys.modules[SPEC.name + ".diagnostics"]
 
 
 def fixture_result(pitch=-8.0):
+    roll_rad, pitch_rad = math.radians(-1), math.radians(pitch)
     return {
         "camera": SimpleNamespace(vfov=torch.tensor([math.radians(60)]), f=torch.tensor([[100., 100.]])),
-        "gravity": SimpleNamespace(rp=torch.tensor([[math.radians(-1), math.radians(pitch)]])),
+        "gravity": SimpleNamespace(
+            rp=torch.tensor([[roll_rad, pitch_rad]]),
+            vec3d=torch.tensor([[-math.sin(roll_rad) * math.cos(pitch_rad),
+                                -math.cos(roll_rad) * math.cos(pitch_rad), math.sin(pitch_rad)]]),
+        ),
         "pitch_uncertainty": torch.tensor([math.radians(4)]),
         "roll_uncertainty": torch.tensor([math.radians(2)]),
         "vfov_uncertainty": torch.tensor([math.radians(10)]),
@@ -120,11 +125,17 @@ class NodeTests(unittest.TestCase):
     def test_single_image_uses_declared_lists(self):
         model = FakeModel()
         out = self.run_node(torch.zeros((1, 64, 80, 3)), model)
-        self.assertEqual(len(out), 7)
+        self.assertEqual(len(out), 10)
         self.assertTrue(all(isinstance(v, list) and len(v) == 1 for v in out))
         self.assertIsInstance(out[0][0], float)
         self.assertEqual(tuple(out[5][0].shape), (1, 64, 80, 3))
         self.assertEqual(json.loads(out[6][0])["frame_index"], 0)
+        report = json.loads(out[6][0])
+        for slot in (7, 8, 9):
+            self.assertIsInstance(out[slot][0], float)
+            self.assertEqual(out[slot][0], report[nodes.GeoCalibNode.RETURN_NAMES[slot]])
+        self.assertEqual(out[7][0], 45.)
+        self.assertFalse(report["apc_compatibility"]["camera_rotation_z_provided"])
         self.assertEqual(model.devices[-1], "cpu")
 
     def test_batch_order_and_scalar_pairing(self):
@@ -135,6 +146,24 @@ class NodeTests(unittest.TestCase):
         self.assertAlmostEqual(out[3][1], -12, places=5)
         self.assertEqual([json.loads(s)["frame_index"] for s in out[6]], [0, 1])
         self.assertTrue(all(type(v) is float for v in out[1]))
+        for index, text in enumerate(out[6]):
+            report = json.loads(text)
+            for slot in (7, 8, 9):
+                self.assertEqual(out[slot][index], report[nodes.GeoCalibNode.RETURN_NAMES[slot]])
+
+    def test_invalid_gravity_fails_instead_of_returning_level_and_offloads(self):
+        result = fixture_result()
+        result["gravity"].vec3d = torch.zeros((1, 3))
+        model = FakeModel([result])
+        with self.assertRaises(ValueError):
+            self.run_node(torch.zeros((1, 64, 80, 3)), model)
+        self.assertEqual(model.devices[-1], "cpu")
+
+    def test_focal_conversion_uses_fx_not_fy(self):
+        result = fixture_result()
+        result["camera"].f = torch.tensor([[100., 200.]])
+        out = self.run_node(torch.zeros((1, 64, 80, 3)), FakeModel([result]))
+        self.assertEqual(out[7][0], 45.)
 
     def test_rgba_strips_alpha(self):
         model = FakeModel()

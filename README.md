@@ -2,7 +2,7 @@
 
 Single-image camera calibration in ComfyUI, based on [Antilopax's wrapper](https://github.com/Antilopax/ComfyUI-GeoCalib) and the **official [cvg/GeoCalib](https://github.com/cvg/GeoCalib) backend**.
 
-This fork preserves `GeoCalibNode`, the original widget order, and output slots 0–2. It adds uncertainty, a fitted-horizon preview, correctly declared per-frame outputs, and an explicit positive-down tilt output.
+This fork preserves `GeoCalibNode`, the original widget order, and all existing output slots. It adds uncertainty, a fitted-horizon preview, correctly declared per-frame outputs, positive-down tilt, and APC-compatible focal length and X/Y camera rotations. It does not estimate or add a heading/Z output.
 
 ## Install
 
@@ -52,22 +52,46 @@ An estimated field of view is not proof that a more complex distortion model fit
 3. **`camera_tilt_deg` — FLOAT:** `-pitch`; **positive means looking down**, zero means level.
 4. **`pitch_uncertainty_deg` — FLOAT:** model-reported pitch uncertainty in degrees.
 5. **`horizon_preview` — IMAGE:** input-size RGB preview with the fitted zero-latitude horizon and numerical labels. It does not rectify, crop or warp the input. Distorted camera models use their actual fitted latitude field, not a straight-line approximation.
-6. **`debug_json` — STRING:** per-frame roll/pitch/FOV, their uncertainties, focal length and uncertainty, distortion coefficients where applicable, frame index, image dimensions and backend revision metadata.
+6. **`debug_json` — STRING:** per-frame roll/pitch/FOV, uncertainties, pixel focal length, the three APC values and their conventions, fitted gravity vector, distortion coefficients where applicable, frame index, image dimensions and backend revision metadata.
+7. **`focal_length_mm` — FLOAT:** 36 mm horizontal sensor-fit equivalent focal length, matching APC's lens input. This is not recovered physical lens/EXIF metadata.
+8. **`camera_rotation_x_degrees` — FLOAT:** APC/Blender XYZ rotation X, solved jointly with Y to match the estimated pitch and roll. A level camera has X=90°.
+9. **`camera_rotation_y_degrees` — FLOAT:** APC/Blender XYZ rotation Y from the same conversion. It is not simply native `roll` when the camera is tilted.
 
 All outputs are declared lists, with one scalar/preview/report per input frame **in input order**. A single image produces a list of one which ComfyUI maps normally. Every preview item is a standard `[1,H,W,3]` IMAGE, allowing scalar and image outputs to stay paired downstream. This is independent per-image calibration, **not** shared-intrinsics or multi-camera-rig calibration.
 
 ### ECHO / APC camera wiring
 
-Connect **`camera_tilt_deg`**, not native `pitch`, to a positive-down camera tilt input:
+For **APC: Interactive Mesh Camera**, connect the three new outputs to the inputs with exactly the same names:
 
 ```text
-camera_tilt_deg = -pitch
-camera_rotation_x_degrees = 90 - camera_tilt_deg
+GeoCalib focal_length_mm             -> APC focal_length_mm
+GeoCalib camera_rotation_x_degrees   -> APC camera_rotation_x_degrees
+GeoCalib camera_rotation_y_degrees   -> APC camera_rotation_y_degrees
 ```
 
-The sign is verified against the official backend's ray/latitude geometry. A negative native pitch puts the optical axis below the horizon: it is looking down.
+Convert those APC widgets to inputs if necessary. Leave `camera_rotation_z_degrees` under your own control; there is no heading input or output in GeoCalib.
 
-Camera height is independent and is not estimated by this node. If a downstream camera also has an additive tilt offset or an automatic camera override, disable/reset those when the supplied tilt must remain authoritative. Roll is not applied automatically by a pitch-only connection.
+**Viewport limitation:** the inspected APC version only mirrors its dedicated height/tilt override wires back into its interactive viewport. Direct lens/X/Y links drive its server-side render and camera outputs, but its 3D viewport can retain old widget values. Use the rendered IMAGE/camera outputs to verify the connection. This fork does not modify APC or its frontend.
+
+For the estimated camera rather than an adjusted/automatic composition:
+
+- Set APC `is_full_auto=false`.
+- Set APC `camera_tilt_offset_deg=0` and `camera_fov_offset_deg=0`.
+- **Leave APC's optional `camera_tilt_deg` disconnected.** It overrides the converted X value and breaks the combined pitch/roll mapping.
+- Match APC's output aspect ratio to the calibrated image. Keep camera height/location separately controlled; GeoCalib does not estimate them.
+
+The focal conversion uses the actual calibration-input width, not a hard-coded resolution or the preview height:
+
+```text
+focal_length_mm = fx_pixels * 36 / image_width_pixels
+APC horizontal_FOV = 2 * atan(36 / (2 * focal_length_mm))
+```
+
+Rotations match the fitted gravity vector in APC's `Rz @ Ry @ Rx` convention after converting camera axes from `(right, down, forward)` to Blender's `(right, up, backward)`. This preserves the estimated pitch and roll for any independently selected Z rotation; it does not reconstruct absolute orientation. At nonzero roll, X need not equal `90 + pitch`. Geometry tests cover combined tilt/roll and Euler singularities.
+
+APC is a pinhole camera: these wires do **not** transfer lens-distortion coefficients or undistort the image. Prefer `pinhole` for a directly matched rectilinear camera. The node never silently clamps focal length; JSON flags values outside APC's 10–150 mm widget range. APC separately clamps its effective FOV to 1–170°, so extreme estimates can still be limited there.
+
+**Legacy pitch-only wiring:** use `camera_tilt_deg = -pitch` for a positive-down tilt input, instead of connecting the new X/Y pair. APC then sets `camera_rotation_x_degrees = 90 - camera_tilt_deg`. This preserves the old behavior but does not apply estimated roll. Do not mix the two wiring methods.
 
 ## Confidence and failure handling
 
@@ -85,6 +109,12 @@ With the backend and node dependencies installed:
 ```bash
 python -m unittest discover -s tests -v
 python scripts/smoke_test.py /path/to/photo.png --output-dir outputs/smoke --batch 2
+```
+
+Optional, when APC is installed, compare against its actual camera math without model inference:
+
+```bash
+python scripts/verify_apc_geometry.py --apc-camera-ops /path/to/apc-pipeline/apc/camera_ops.py
 ```
 
 Unit tests use explicit test doubles for node plumbing and the actual official geometry classes for sign/model checks; they do **not** claim to run learned inference. The smoke script runs the real model, checks per-frame outputs and source-size previews, and compares the wrapper's numbers against the official API using identical RNG state. It writes genuine `results.json` and horizon PNGs locally. Test images/results are not committed.

@@ -60,6 +60,63 @@ def describe_result(result):
     return report
 
 
+def focal_pixels_to_mm(focal_x_px, image_width_px):
+    """APC's 36 mm horizontal sensor-fit equivalent, not physical lens metadata."""
+    focal = finite_scalar(focal_x_px, "horizontal focal length")
+    width = finite_scalar(image_width_px, "image width")
+    if focal <= 0 or width <= 0:
+        raise ValueError("Focal length and image width must be positive.")
+    result = (focal / width) * 36.0
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError("Focal conversion must produce a finite positive lens value.")
+    # Do not clamp estimates to APC's widget range and silently change the FoV.
+    return result
+
+
+def gravity_to_apc_rotation_xy_degrees(gravity_vec3):
+    """Match GeoCalib up in APC's Blender XYZ camera, without estimating Z.
+
+    GeoCalib camera axes are (right, down, forward); Blender camera axes are
+    (right, up, backward). For R = Rz @ Ry @ Rx, world +Z in camera space is
+    R.T @ [0,0,1] = [-sin(y), cos(y)*sin(x), cos(y)*cos(x)], independent of z.
+    Match that vector to [gx, -gy, -gz], solving x/y together rather than
+    copying native pitch/roll into Euler controls. Use the fitted vector
+    directly: GeoCalib's rp accessor adds an epsilon when recovering roll.
+    """
+    gravity = as_numpy(gravity_vec3).astype(np.float64).reshape(-1)
+    if gravity.size != 3 or not np.isfinite(gravity).all():
+        raise ValueError("Expected one finite 3D GeoCalib gravity vector.")
+    norm = math.hypot(*gravity)
+    if not math.isfinite(norm) or norm <= 0:
+        raise ValueError("GeoCalib gravity vector must have a finite positive norm.")
+    gx, gy, gz = gravity / norm
+    transverse = math.hypot(gy, gz)
+    # At y=+/-90, x is unconstrained by gravity. Choose the level-camera branch.
+    rotation_x = 90.0 if transverse < 1e-12 else math.degrees(math.atan2(-gy, -gz))
+    rotation_y = math.degrees(math.atan2(-gx, transverse))
+    return rotation_x, rotation_y
+
+
+def apc_camera_parameters(focal_x_px, image_width_px, gravity_vec3):
+    """The three APC sockets plus auditable conversion metadata."""
+    focal = focal_pixels_to_mm(focal_x_px, image_width_px)
+    rotation_x, rotation_y = gravity_to_apc_rotation_xy_degrees(gravity_vec3)
+    return {
+        "focal_length_mm": focal,
+        "camera_rotation_x_degrees": rotation_x,
+        "camera_rotation_y_degrees": rotation_y,
+        "gravity_up_camera_cv": as_numpy(gravity_vec3).reshape(-1).astype(float).tolist(),
+        "apc_compatibility": {
+            "sensor_width_mm": 36.0,
+            "sensor_fit": "horizontal",
+            "rotation_order": "Blender XYZ: Rz @ Ry @ Rx",
+            "camera_rotation_z_provided": False,
+            "distortion_transferred": False,
+            "focal_length_mm_in_widget_range": 10.0 <= focal <= 150.0,
+        },
+    }
+
+
 def horizon_mask(latitude):
     """Zero crossings of the FITTED latitude field, not the neural field guess."""
     lat = as_numpy(latitude)

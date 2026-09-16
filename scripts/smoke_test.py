@@ -45,7 +45,7 @@ def main():
     start = time.perf_counter()
     outputs = nodes.GeoCalibNode().analyze_image(image, args.weights, args.camera_model)
     elapsed = time.perf_counter() - start
-    assert len(outputs) == 7 and all(len(o) == args.batch for o in outputs)
+    assert len(outputs) == 10 and all(len(o) == args.batch for o in outputs)
     reports = [json.loads(s) for s in outputs[6]]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for index, (preview, report) in enumerate(zip(outputs[5], reports)):
@@ -54,6 +54,8 @@ def main():
         assert abs(outputs[3][index] + outputs[1][index]) < 1e-8
         assert outputs[4][index] >= 0
         assert report["frame_index"] == index
+        for slot in (7, 8, 9):
+            assert outputs[slot][index] == report[nodes.GeoCalibNode.RETURN_NAMES[slot]]
         pixels = np.rint(preview[0].numpy() * 255).clip(0, 255).astype(np.uint8)
         Image.fromarray(pixels).save(args.output_dir / f"horizon_{index:02d}.png")
     # Compare against the current official API with the exact same source tensor.
@@ -67,10 +69,16 @@ def main():
         with torch.inference_mode():
             direct = model.calibrate(image[0].permute(2, 0, 1).contiguous().to(device), camera_model=args.camera_model)
             reference = nodes.describe_result(direct)
+            reference.update(nodes.apc_camera_parameters(
+                reference["focal_length_px"]["fx"], rgb.shape[1], direct["gravity"].vec3d,
+            ))
         del direct
     finally:
         model.to("cpu")
-    errors = {k: abs(reports[0][k] - reference[k]) for k in ("roll_deg", "pitch_deg", "vfov_deg", "pitch_uncertainty_deg")}
+    errors = {k: abs(reports[0][k] - reference[k]) for k in (
+        "roll_deg", "pitch_deg", "vfov_deg", "pitch_uncertainty_deg", "focal_length_mm",
+        "camera_rotation_x_degrees", "camera_rotation_y_degrees",
+    )}
     assert max(errors.values()) < 0.001, errors
     result = {"runtime": "real GeoCalib inference", "torch": torch.__version__, "device": str(device), "batch_size": args.batch, "elapsed_seconds": elapsed, "direct_api_absolute_errors": errors, "reports": reports}
     (args.output_dir / "results.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")

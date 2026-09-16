@@ -5,7 +5,7 @@ import threading
 
 import torch
 
-from .diagnostics import describe_result, render_horizon
+from .diagnostics import apc_camera_parameters, describe_result, render_horizon
 
 UPSTREAM_COMMIT = "97b8968e7798a66bf04fcf791fb535624241bda7"
 _MODELS = {}
@@ -93,17 +93,23 @@ class GeoCalibNode:
             },
         }
 
-    # Existing saved workflows keep their node ID, widget order and slots 0-2.
-    RETURN_TYPES = ("FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "IMAGE", "STRING")
-    RETURN_NAMES = ("roll", "pitch", "vfov", "camera_tilt_deg", "pitch_uncertainty_deg", "horizon_preview", "debug_json")
-    OUTPUT_IS_LIST = (True, True, True, True, True, True, True)
+    # Preserve all existing slots 0-6; append the three APC-compatible controls.
+    RETURN_TYPES = ("FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "IMAGE", "STRING", "FLOAT", "FLOAT", "FLOAT")
+    RETURN_NAMES = (
+        "roll", "pitch", "vfov", "camera_tilt_deg", "pitch_uncertainty_deg", "horizon_preview", "debug_json",
+        "focal_length_mm", "camera_rotation_x_degrees", "camera_rotation_y_degrees",
+    )
+    OUTPUT_IS_LIST = (True, True, True, True, True, True, True, True, True, True)
     FUNCTION = "analyze_image"
     CATEGORY = "GeoCalib"
     DESCRIPTION = (
         "Estimate roll/pitch/vertical FoV in degrees. Native pitch is positive UP; "
         "camera_tilt_deg is positive DOWN for ECHO/APC. Uncertainty is model-reported, "
         "not a guaranteed error bound. The preview overlays the fitted horizon without "
-        "changing perspective. Each output maps over frames in input order."
+        "changing perspective. APC outputs use 36 mm horizontal sensor fit and Blender XYZ "
+        "X/Y rotations matching pitch AND roll; no heading/Z is estimated. Connect the "
+        "three matching APC inputs, leave camera_tilt_deg disconnected, disable full-auto, "
+        "and reset tilt/FOV offsets to 0. Each output maps over frames in input order."
     )
 
     def analyze_image(self, image, weights="pinhole", camera_model="pinhole"):
@@ -111,7 +117,7 @@ class GeoCalibNode:
         schema = self.INPUT_TYPES()["required"]
         if weights not in schema["weights"][0] or camera_model not in schema["camera_model"][0]:
             raise ValueError("Unsupported GeoCalib weights or camera model.")
-        outputs = ([], [], [], [], [], [], [])
+        outputs = tuple([] for _ in self.RETURN_TYPES)
         backend = _backend_metadata()
         # The backend mutates its optimizer's camera model, so protect cached
         # models against concurrent calls. Cache on CPU, not permanently on VRAM.
@@ -128,6 +134,9 @@ class GeoCalibNode:
                     with torch.inference_mode():
                         result = model.calibrate(tensor, camera_model=camera_model)
                         report = describe_result(result)
+                        report.update(apc_camera_parameters(
+                            report["focal_length_px"]["fx"], int(rgb.shape[1]), result["gravity"].vec3d,
+                        ))
                         preview, visible = render_horizon(rgb, _latitude_field(result), report)
                     report.update({
                         "schema_version": 1, "frame_index": index,
@@ -140,6 +149,8 @@ class GeoCalibNode:
                         report["camera_tilt_deg"], report["pitch_uncertainty_deg"],
                         torch.from_numpy(preview).unsqueeze(0),
                         json.dumps(report, indent=2, allow_nan=False),
+                        report["focal_length_mm"],
+                        report["camera_rotation_x_degrees"], report["camera_rotation_y_degrees"],
                     )
                     for output, value in zip(outputs, values):
                         output.append(value)
