@@ -1,104 +1,165 @@
+"""ComfyUI adapter for the official, commit-pinned GeoCalib backend."""
+import importlib.metadata
+import json
+import threading
+
 import torch
-import numpy as np
 
-# Try to import GeoCalib; handle the error if it's not installed
-try:
-    from geocalib import GeoCalib
-    from geocalib.utils import rad2deg
-    GEOCALIB_AVAILABLE = True
-except ImportError:
-    GEOCALIB_AVAILABLE = False
-    print("⚠️ GeoCalib node warning: 'geocalib' module not found. Please install it: pip install git+https://github.com/cvg/GeoCalib")
+from .diagnostics import apc_camera_parameters, describe_result, render_horizon
 
-# Cache models to avoid reloading them on every execution
+UPSTREAM_COMMIT = "97b8968e7798a66bf04fcf791fb535624241bda7"
 _MODELS = {}
+_MODEL_LOCK = threading.RLock()
+
+
+def _get_model(weights):
+    if weights not in _MODELS:
+        try:
+            from geocalib import GeoCalib
+        except ImportError as exc:
+            raise ImportError(
+                "GeoCalib backend unavailable. Install this node's requirements.txt "
+                "with the Python interpreter used by ComfyUI."
+            ) from exc
+        # GeoCalib downloads official v1.0 weights lazily to the Torch Hub cache.
+        _MODELS[weights] = GeoCalib(weights=weights).eval().cpu()
+    return _MODELS[weights]
+
+
+def _device():
+    try:
+        import comfy.model_management as mm
+    except ImportError:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return mm.get_torch_device()
+
+
+def _check_interrupted():
+    try:
+        import comfy.model_management as mm
+    except ImportError:
+        return
+    mm.throw_exception_if_processing_interrupted()
+
+
+def _release_cache():
+    try:
+        import comfy.model_management as mm
+    except ImportError:
+        return
+    mm.soft_empty_cache()
+
+
+def _backend_metadata():
+    try:
+        dist = importlib.metadata.distribution("geocalib")
+        direct = json.loads(dist.read_text("direct_url.json") or "{}")
+        commit = direct.get("vcs_info", {}).get("commit_id")
+        version = dist.version
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        version, commit = None, None
+    return {"package_version": version, "installed_revision": commit, "expected_revision": UPSTREAM_COMMIT}
+
+
+def _latitude_field(result):
+    from geocalib.perspective_fields import get_latitude_field
+    # Reproject the solved camera, including distortion. The network's raw
+    # latitude_field need not agree exactly with the fitted camera/horizon.
+    camera, gravity = result["camera"].cpu(), result["gravity"].cpu()
+    return get_latitude_field(camera, gravity)[0, :, :, 0].detach().cpu().numpy()
+
+
+def _validate_image(image):
+    if not isinstance(image, torch.Tensor) or image.ndim != 4:
+        raise ValueError("GeoCalib expects an IMAGE tensor shaped [B,H,W,C].")
+    if image.shape[0] < 1 or min(image.shape[1:3]) < 32 or image.shape[3] not in (3, 4):
+        raise ValueError("GeoCalib requires a nonempty batch of RGB/RGBA images at least 32 pixels per side.")
+    if not image.is_floating_point() or not torch.isfinite(image).all():
+        raise ValueError("GeoCalib IMAGE input must contain finite floating-point pixels.")
+    if image.min().item() < 0 or image.max().item() > 1:
+        raise ValueError("GeoCalib IMAGE pixels must be in [0,1].")
+
 
 class GeoCalibNode:
-    """
-    ComfyUI Node to extract Roll, Pitch, and vFoV using GeoCalib.
-    """
-    
+    """Single-image calibration, explicitly mapped per frame for IMAGE batches."""
+
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
                 "weights": (["pinhole", "distorted"], {"default": "pinhole"}),
-                "camera_model": (["pinhole", "simple_radial", "simple_divisional"], {"default": "pinhole"}),
+                "camera_model": (["pinhole", "simple_radial", "simple_divisional", "radial"], {"default": "pinhole"}),
             },
         }
 
-    RETURN_TYPES = ("FLOAT", "FLOAT", "FLOAT")
-    RETURN_NAMES = ("roll", "pitch", "vfov")
+    # Preserve all existing slots 0-6; append the three APC-compatible controls.
+    RETURN_TYPES = ("FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "IMAGE", "STRING", "FLOAT", "FLOAT", "FLOAT")
+    RETURN_NAMES = (
+        "roll", "pitch", "vfov", "camera_tilt_deg", "pitch_uncertainty_deg", "horizon_preview", "debug_json",
+        "focal_length_mm", "camera_rotation_x_degrees", "camera_rotation_y_degrees",
+    )
+    OUTPUT_IS_LIST = (True, True, True, True, True, True, True, True, True, True)
     FUNCTION = "analyze_image"
     CATEGORY = "GeoCalib"
+    DESCRIPTION = (
+        "Estimate roll/pitch/vertical FoV in degrees. Native pitch is positive UP; "
+        "camera_tilt_deg is positive DOWN for ECHO/APC. Uncertainty is model-reported, "
+        "not a guaranteed error bound. The preview overlays the fitted horizon without "
+        "changing perspective. APC outputs use 36 mm horizontal sensor fit and Blender XYZ "
+        "X/Y rotations matching pitch AND roll; no heading/Z is estimated. Connect the "
+        "three matching APC inputs, leave camera_tilt_deg disconnected, disable full-auto, "
+        "and reset tilt/FOV offsets to 0. Each output maps over frames in input order."
+    )
 
-    def analyze_image(self, image, weights, camera_model):
-        if not GEOCALIB_AVAILABLE:
-            raise ImportError("GeoCalib library not found. Please install it using: pip install git+https://github.com/cvg/GeoCalib")
+    def analyze_image(self, image, weights="pinhole", camera_model="pinhole"):
+        _validate_image(image)
+        schema = self.INPUT_TYPES()["required"]
+        if weights not in schema["weights"][0] or camera_model not in schema["camera_model"][0]:
+            raise ValueError("Unsupported GeoCalib weights or camera model.")
+        outputs = tuple([] for _ in self.RETURN_TYPES)
+        backend = _backend_metadata()
+        # The backend mutates its optimizer's camera model, so protect cached
+        # models against concurrent calls. Cache on CPU, not permanently on VRAM.
+        with _MODEL_LOCK:
+            _check_interrupted()
+            model = _get_model(weights)
+            try:
+                device = _device()
+                model.to(device)
+                for index, frame in enumerate(image):
+                    _check_interrupted()
+                    rgb = frame[..., :3].detach().to(device="cpu", dtype=torch.float32)
+                    tensor = rgb.permute(2, 0, 1).contiguous().to(device)
+                    with torch.inference_mode():
+                        result = model.calibrate(tensor, camera_model=camera_model)
+                        report = describe_result(result)
+                        report.update(apc_camera_parameters(
+                            report["focal_length_px"]["fx"], int(rgb.shape[1]), result["gravity"].vec3d,
+                        ))
+                        preview, visible = render_horizon(rgb, _latitude_field(result), report)
+                    report.update({
+                        "schema_version": 1, "frame_index": index,
+                        "image_size": {"width": int(rgb.shape[1]), "height": int(rgb.shape[0])},
+                        "weights": weights, "camera_model": camera_model,
+                        "horizon_visible": visible, "backend": backend,
+                    })
+                    values = (
+                        report["roll_deg"], report["pitch_deg"], report["vfov_deg"],
+                        report["camera_tilt_deg"], report["pitch_uncertainty_deg"],
+                        torch.from_numpy(preview).unsqueeze(0),
+                        json.dumps(report, indent=2, allow_nan=False),
+                        report["focal_length_mm"],
+                        report["camera_rotation_x_degrees"], report["camera_rotation_y_degrees"],
+                    )
+                    for output, value in zip(outputs, values):
+                        output.append(value)
+                    del result, tensor
+            finally:
+                model.to("cpu")
+                _release_cache()
+        return outputs
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Load the model if not already loaded
-        if weights not in _MODELS:
-            print(f"Loading GeoCalib model (weights='{weights}')...")
-            # This will download weights on the first run
-            _MODELS[weights] = GeoCalib(weights=weights).to(device)
-        
-        model = _MODELS[weights]
-        
-        # Prepare outputs
-        rolls = []
-        pitches = []
-        vfovs = []
-
-        # Process batch (ComfyUI passes images as [B, H, W, C])
-        for i in range(image.shape[0]):
-            # Convert to [C, H, W] and send to device
-            img_tensor = image[i].permute(2, 0, 1).to(device)
-            
-            with torch.inference_mode():
-                # Run calibration
-                results = model.calibrate(img_tensor, camera_model=camera_model)
-            
-            camera = results["camera"]
-            gravity = results["gravity"]
-
-            # Extract vFoV (Vertical Field of View)
-            # GeoCalib returns vfov in radians, convert to degrees
-            vfov_deg = rad2deg(camera.vfov).item()
-            
-            # Extract Roll and Pitch
-            # gravity.rp contains roll and pitch in radians
-            rp_deg = rad2deg(gravity.rp) # Tensor shape usually [2]
-            
-            # Ensure we get scalar values
-            if rp_deg.numel() == 2:
-                roll_deg, pitch_deg = rp_deg.unbind(-1)
-                roll_val = roll_deg.item()
-                pitch_val = pitch_deg.item()
-            else:
-                # Fallback if shape is unexpected
-                roll_val = rp_deg[0].item()
-                pitch_val = rp_deg[1].item()
-
-            rolls.append(roll_val)
-            pitches.append(pitch_val)
-            vfovs.append(vfov_deg)
-
-        # If processing a single image, return single floats.
-        # If batch > 1, ComfyUI handles lists if the receiving node supports it, 
-        # or you can use a "Get Item" node. 
-        if len(rolls) == 1:
-            return (rolls[0], pitches[0], vfovs[0])
-        else:
-            return (rolls, pitches, vfovs)
-
-# Mapping for ComfyUI to recognize the node
-NODE_CLASS_MAPPINGS = {
-    "GeoCalibNode": GeoCalibNode
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "GeoCalibNode": "GeoCalib Estimator"
-}
+NODE_CLASS_MAPPINGS = {"GeoCalibNode": GeoCalibNode}
+NODE_DISPLAY_NAME_MAPPINGS = {"GeoCalibNode": "GeoCalib Estimator"}

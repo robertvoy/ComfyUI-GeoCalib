@@ -1,1 +1,3 @@
-git+https://github.com/Antilopax/GeoCalib.git
+git+https://github.com/cvg/GeoCalib.git@97b8968e7798a66bf04fcf791fb535624241bda7
+numpy
+Pillow
